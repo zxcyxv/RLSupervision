@@ -1,0 +1,38 @@
+# RVSAC training config (TRM defaults where applicable)
+
+defaults:
+  - arch: rvsac
+  - _self_
+
+hydra:
+  output_subdir: null
+
+data_paths: ['data/sudoku-extreme-1k-aug-1000']
+data_paths_test: []
+
+evaluators: []
+
+global_batch_size: 768
+
+epochs: 20000
+eval_interval: 2000
+checkpoint_every_eval: True
+
+lr: 1e-4
+lr_min_ratio: 1.0
+lr_warmup_steps: 2000
+
+beta1: 0.9
+beta2: 0.95
+weight_decay: 0.1
+puzzle_emb_weight_decay: 0.1
+puzzle_emb_lr: 1e-2
+
+target_tau: 0.005  # Polyak rate for the target value head
+
+seed: 0
+min_eval_interval: 0
+
+ema: False
+ema_rate: 0.999
+freeze_weights: False

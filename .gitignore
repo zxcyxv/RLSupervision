@@ -1,0 +1,24 @@
+# Python/runtime artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Experiment data and generated outputs
+data/
+checkpoints/
+outputs/
+wandb/
+logs/
+*.log
+runs_*.log
+
+# Large/local benchmark assets
+ref/
+ref/TinyRecursiveModels/kaggle/
+
+# Environment/local files
+.env
+.venv/
+venv/
+*.egg-info/

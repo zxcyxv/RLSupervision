@@ -1,0 +1,26 @@
+name: rvsac.model@RVSAC
+loss:
+  name: rvsac.losses@RVSACLossHead
+  loss_type: stablemax_cross_entropy
+  gamma: 0.95      # discount over recursion steps
+  lam: 0.9         # TD(lambda)
+  beta: 0.1        # actor weight (two-timescale: critic fast, actor slow)
+  critic_coef: 1.0
+
+horizon: 16        # H recursion steps per rollout (BPTT window)
+bptt_segment: 0    # 0 = full BPTT; e.g. 8 = detach state every 8 steps and use K-step bootstraps
+L_layers: 2
+
+hidden_size: 512
+num_heads: 8
+expansion: 4
+
+puzzle_emb_ndim: ${.hidden_size}
+
+pos_encodings: rope
+forward_dtype: bfloat16
+
+mlp_t: False
+puzzle_emb_len: 16
+
+critic_shapes_trunk: False  # True = MuZero-style (value gradient shapes trunk)
