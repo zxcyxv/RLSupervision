@@ -82,6 +82,7 @@ class PretrainConfig(pydantic.BaseModel):
 
     seed: int = 0
     checkpoint_every_eval: bool = False
+    eval_only: bool = False
     eval_interval: Optional[int] = None
     min_eval_interval: Optional[int] = 0
     eval_save_outputs: List[str] = []
@@ -208,7 +209,14 @@ def load_checkpoint(model: nn.Module, config: PretrainConfig):
     if config.load_checkpoint is not None:
         print(f"Loading checkpoint {config.load_checkpoint}")
         state_dict = torch.load(config.load_checkpoint, map_location="cuda")
-        model.load_state_dict(state_dict, assign=True)
+        try:
+            model.load_state_dict(state_dict, assign=True)
+        except RuntimeError:
+            if any(k.startswith("_orig_mod.") for k in state_dict):
+                state_dict = {k.removeprefix("_orig_mod."): v for k, v in state_dict.items()}
+            else:
+                state_dict = {f"_orig_mod.{k}": v for k, v in state_dict.items()}
+            model.load_state_dict(state_dict, assign=True)
 
 
 def compute_lr(base_lr: float, config: PretrainConfig, train_state: TrainState):
@@ -295,6 +303,7 @@ def evaluate(
         for evaluator in evaluators:
             evaluator.begin_eval()
             return_keys.update(evaluator.required_outputs)
+        return_keys = tuple(sorted(return_keys))
 
         set_ids = {k: idx for idx, k in enumerate(eval_metadata.sets)}
         save_preds = {}
@@ -442,6 +451,20 @@ def launch(hydra_config: DictConfig):
         print('Setup EMA')
         ema_helper = EMAHelper(mu=config.ema_rate)
         ema_helper.register(train_state.model)
+
+    if config.eval_only:
+        if eval_loader is None:
+            raise ValueError("eval_only=True requires eval data.")
+        train_state.model.eval()
+        metrics = evaluate(config, train_state, eval_loader, eval_metadata, evaluators,
+                           rank=RANK, world_size=WORLD_SIZE, cpu_group=CPU_PROCESS_GROUP)
+        if RANK == 0 and metrics is not None:
+            wandb.log(metrics, step=train_state.step)
+            print(f"\nEVAL step {train_state.step}: {metrics}")
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        wandb.finish()
+        return
 
     for _iter_id in range(total_iters):
         print(f"[Rank {RANK}, World Size {WORLD_SIZE}]: Epoch {_iter_id * train_epochs_per_iter}")

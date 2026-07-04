@@ -166,11 +166,14 @@ class RVSACLossHead(nn.Module):
                 "segment_terminal_mean": segment_terminal_mean * valid.sum(),
             }
 
-        detached = {
-            "preds": preds,
-            "logits": final_logits.detach(),
-            # Value as answer-ranking score (replaces TRM's q_halt_logits for evaluators)
-            "q_halt_logits": terminal_value.detach(),
-        }
+        detached = {}
+        if "preds" in return_keys:
+            detached["preds"] = preds
+        if "logits" in return_keys:
+            detached["logits"] = final_logits.detach()
+        if "q_halt_logits" in return_keys:
+            # ARC evaluator compatibility: use terminal value as answer-ranking score.
+            # This is not a TRM-style halting head in the RVSAC model.
+            detached["q_halt_logits"] = terminal_value.detach()
 
         return loss, metrics, detached
