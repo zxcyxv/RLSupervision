@@ -205,6 +205,13 @@ def save_train_state(config: PretrainConfig, train_state: TrainState):
     torch.save(train_state.model.state_dict(), os.path.join(config.checkpoint_path, f"step_{train_state.step}"))
 
 
+def save_named_train_state(config: PretrainConfig, train_state: TrainState, name: str):
+    if config.checkpoint_path is None:
+        return
+    os.makedirs(config.checkpoint_path, exist_ok=True)
+    torch.save(train_state.model.state_dict(), os.path.join(config.checkpoint_path, name))
+
+
 def load_checkpoint(model: nn.Module, config: PretrainConfig):
     if config.load_checkpoint is not None:
         print(f"Loading checkpoint {config.load_checkpoint}")
@@ -485,6 +492,9 @@ def launch(hydra_config: DictConfig):
                 ema_helper.update(train_state.model)
 
         if eval_loader is not None and _iter_id >= config.min_eval_interval:
+            if RANK == 0 and (config.checkpoint_every_eval or (_iter_id == total_iters - 1)):
+                save_train_state(config, train_state)
+
             if config.ema:
                 print("SWITCH TO EMA")
                 train_state_eval = copy.deepcopy(train_state)
@@ -501,7 +511,10 @@ def launch(hydra_config: DictConfig):
                 print(f"\nEVAL step {train_state.step}: {metrics}")
 
             if RANK == 0 and (config.checkpoint_every_eval or (_iter_id == total_iters - 1)):
-                save_train_state(config, train_state_eval)
+                if config.ema:
+                    save_named_train_state(config, train_state_eval, f"step_{train_state.step}_ema")
+                elif train_state_eval is not train_state:
+                    save_train_state(config, train_state_eval)
 
             if config.ema:
                 del train_state_eval
