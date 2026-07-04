@@ -102,6 +102,11 @@ class TrainState:
     total_steps: int
 
 
+def eager_model(model: nn.Module) -> nn.Module:
+    """Return the uncompiled module when torch.compile wrapped it."""
+    return getattr(model, "_orig_mod", model)
+
+
 def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size: int, **kwargs):
     dataset = PuzzleDataset(PuzzleDatasetConfig(
         seed=config.seed,
@@ -457,13 +462,15 @@ def launch(hydra_config: DictConfig):
     if config.ema:
         print('Setup EMA')
         ema_helper = EMAHelper(mu=config.ema_rate)
-        ema_helper.register(train_state.model)
+        ema_helper.register(eager_model(train_state.model))
 
     if config.eval_only:
         if eval_loader is None:
             raise ValueError("eval_only=True requires eval data.")
-        train_state.model.eval()
-        metrics = evaluate(config, train_state, eval_loader, eval_metadata, evaluators,
+        train_state_eval = copy.copy(train_state)
+        train_state_eval.model = eager_model(train_state.model)
+        train_state_eval.model.eval()
+        metrics = evaluate(config, train_state_eval, eval_loader, eval_metadata, evaluators,
                            rank=RANK, world_size=WORLD_SIZE, cpu_group=CPU_PROCESS_GROUP)
         if RANK == 0 and metrics is not None:
             wandb.log(metrics, step=train_state.step)
@@ -489,7 +496,7 @@ def launch(hydra_config: DictConfig):
                                                      "value_mean", "td_abs", "corr_delta_dr", "u_h_ratio", "return_J")}
                     print(f"\nstep {train_state.step}: {shown}")
             if config.ema:
-                ema_helper.update(train_state.model)
+                ema_helper.update(eager_model(train_state.model))
 
         if eval_loader is not None and _iter_id >= config.min_eval_interval:
             if RANK == 0 and (config.checkpoint_every_eval or (_iter_id == total_iters - 1)):
@@ -497,10 +504,11 @@ def launch(hydra_config: DictConfig):
 
             if config.ema:
                 print("SWITCH TO EMA")
-                train_state_eval = copy.deepcopy(train_state)
-                train_state_eval.model = ema_helper.ema_copy(train_state_eval.model)
+                train_state_eval = copy.copy(train_state)
+                train_state_eval.model = ema_helper.ema_copy(eager_model(train_state.model))
             else:
-                train_state_eval = train_state
+                train_state_eval = copy.copy(train_state)
+                train_state_eval.model = eager_model(train_state.model)
 
             train_state_eval.model.eval()
             metrics = evaluate(config, train_state_eval, eval_loader, eval_metadata, evaluators,
