@@ -18,6 +18,7 @@ epochs: 20000
 eval_interval: 2000
 checkpoint_every_eval: True
 eval_only: False
+eval_batches: 10  # null = full test split
 
 lr: 1e-4
 lr_min_ratio: 1.0

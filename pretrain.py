@@ -12,6 +12,7 @@ import math
 import yaml
 import shutil
 import copy
+import itertools
 
 import torch
 import torch.distributed as dist
@@ -85,6 +86,7 @@ class PretrainConfig(pydantic.BaseModel):
     eval_only: bool = False
     eval_interval: Optional[int] = None
     min_eval_interval: Optional[int] = 0
+    eval_batches: Optional[int] = 10
     eval_save_outputs: List[str] = []
 
     ema: bool = False
@@ -318,11 +320,20 @@ def evaluate(
         return_keys = tuple(sorted(return_keys))
 
         set_ids = {k: idx for idx, k in enumerate(eval_metadata.sets)}
+        observed_set_ids = set()
         save_preds = {}
         metric_keys = []
         metric_values = None
 
-        for set_name, batch, global_batch_size in eval_loader:
+        eval_source = eval_loader if config.eval_batches is None else itertools.islice(eval_loader, config.eval_batches)
+        eval_iter = tqdm.tqdm(
+            eval_source,
+            total=config.eval_batches,
+            desc=f"eval step {train_state.step}",
+            disable=rank != 0,
+            leave=False,
+        )
+        for set_name, batch, global_batch_size in eval_iter:
             batch = {k: v.cuda() for k, v in batch.items()}
 
             loss, metrics, preds = train_state.model(batch=batch, return_keys=return_keys)
@@ -337,6 +348,7 @@ def evaluate(
                 evaluator.update_batch(batch, preds)
 
             set_id = set_ids[set_name]
+            observed_set_ids.add(set_id)
             if metric_values is None:
                 metric_keys = list(sorted(metrics.keys()))
                 metric_values = torch.zeros((len(set_ids), len(metrics.values())), dtype=torch.float32, device="cuda")
@@ -359,6 +371,7 @@ def evaluate(
                 reduced_metrics = {
                     set_name: {metric_name: reduced_metrics[set_id, metric_id] for metric_id, metric_name in enumerate(metric_keys)}
                     for set_id, set_name in enumerate(set_ids)
+                    if set_id in observed_set_ids
                 }
                 for set_name, m in reduced_metrics.items():
                     count = max(m.pop("count"), 1)
