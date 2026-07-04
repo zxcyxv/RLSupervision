@@ -172,6 +172,5 @@ class RVSACLossHead(nn.Module):
             # Value as answer-ranking score (replaces TRM's q_halt_logits for evaluators)
             "q_halt_logits": terminal_value.detach(),
         }
-        detached = {k: v for k, v in detached.items() if k in set(return_keys)}
 
         return loss, metrics, detached
