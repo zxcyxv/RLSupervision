@@ -25,3 +25,4 @@ mlp_t: False
 puzzle_emb_len: 16
 
 critic_shapes_trunk: False  # True = MuZero-style (value gradient shapes trunk)
+separate_actor_value_head: False  # True = actor bootstrap uses a separate anchor-trained value head

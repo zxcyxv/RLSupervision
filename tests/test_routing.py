@@ -51,6 +51,12 @@ def grads_by_group(model, loss):
     loss.backward(retain_graph=True)
     def total(mod):
         return sum(p.grad.abs().sum().item() for p in mod.parameters() if p.grad is not None)
+    actor_value_head = 0.0
+    actor_value_head_target = 0.0
+    if getattr(model.config, "separate_actor_value_head", False):
+        actor_value_head = total(model.actor_value_head)
+        actor_value_head_target = sum(0.0 if p.grad is None else p.grad.abs().sum().item()
+                                      for p in model.actor_value_head_target.parameters())
     return {
         "transition": total(model.transition),
         "lm_head": total(model.lm_head),
@@ -58,6 +64,8 @@ def grads_by_group(model, loss):
         "value_head": total(model.value_head),
         "value_head_target": sum(0.0 if p.grad is None else p.grad.abs().sum().item()
                                  for p in model.value_head_target.parameters()),
+        "actor_value_head": actor_value_head,
+        "actor_value_head_target": actor_value_head_target,
     }
 
 
@@ -79,6 +87,8 @@ def test_critic_isolated():
     assert g["lm_head"] == 0, f"critic leaked into classifier: {g['lm_head']}"
     assert g["embed"] == 0, f"critic leaked into embeddings: {g['embed']}"
     assert g["value_head_target"] == 0
+    assert g["actor_value_head"] == 0
+    assert g["actor_value_head_target"] == 0
     print("PASS critic_isolated", g)
 
 
@@ -98,6 +108,51 @@ def test_eq_anchor_isolated():
     assert g["embed"] == 0, f"anchor leaked into embeddings: {g['embed']}"
     assert g["value_head_target"] == 0
     print("PASS eq_anchor_isolated", g)
+
+
+def test_separate_actor_value_head_routing():
+    """Optional split mode: TD critic trains value_head; terminal anchor trains
+    actor_value_head; actor bootstrap uses only the frozen actor target head."""
+    model, head = make_model(separate_actor_value_head=True)
+    batch = make_batch()
+
+    out = model(batch)
+    with torch.no_grad():
+        y = torch.randn_like(out["target_values"])
+    critic_loss = (0.5 * (out["values"] - y).square()).mean(-1).sum()
+    g = grads_by_group(model, critic_loss)
+    assert g["value_head"] > 0
+    assert g["actor_value_head"] == 0, f"critic leaked into actor value head: {g['actor_value_head']}"
+    assert g["transition"] == 0
+
+    out = model(batch)
+    target = torch.randn_like(out["terminal_online_value"])
+    anchor_loss = (0.5 * (out["terminal_online_value"] - target).square()).mean()
+    g = grads_by_group(model, anchor_loss)
+    assert g["actor_value_head"] > 0
+    assert g["value_head"] == 0, f"anchor leaked into critic value head: {g['value_head']}"
+    assert g["transition"] == 0
+    assert g["actor_value_head_target"] == 0
+
+    out = model(batch)
+    B, H = out["values"].shape
+    labels = batch["labels"]
+    mask = labels != -100
+    from rvsac.losses import stablemax_cross_entropy
+    labels_h = labels.unsqueeze(1).expand(-1, H, -1)
+    ce_tok = stablemax_cross_entropy(out["logits"], labels_h, valid_mask=mask.unsqueeze(1))
+    ce = ce_tok.to(torch.float32).sum(-1) / mask.sum(-1).clamp_min(1).unsqueeze(-1)
+    r = -ce
+    disc = 0.95 ** torch.arange(H, dtype=torch.float32)
+    actor_loss = -((disc * r).sum(-1) + (0.95 ** H) * out["terminal_value"]).sum()
+    g = grads_by_group(model, actor_loss)
+    assert g["transition"] > 0
+    assert g["lm_head"] > 0
+    assert g["value_head"] == 0
+    assert g["actor_value_head"] == 0
+    assert g["value_head_target"] == 0
+    assert g["actor_value_head_target"] == 0
+    print("PASS separate_actor_value_head_routing", g)
 
 
 def test_actor_routing():
@@ -123,6 +178,8 @@ def test_actor_routing():
     assert g["embed"] > 0, "actor must train the encoder"
     assert g["value_head"] == 0, f"actor leaked into critic params: {g['value_head']}"
     assert g["value_head_target"] == 0, "target head params must stay frozen"
+    assert g["actor_value_head"] == 0, f"actor leaked into actor value params: {g['actor_value_head']}"
+    assert g["actor_value_head_target"] == 0
     # terminal value must still carry gradient INTO the state (costate supply).
     # fc2 of the target head is zero-init, so grad_h V_bar == 0 at init; give it
     # nonzero weights (as Polyak updates would after critic training) first.
@@ -260,6 +317,7 @@ if __name__ == "__main__":
     test_td_lambda_targets()
     test_critic_isolated()
     test_eq_anchor_isolated()
+    test_separate_actor_value_head_routing()
     test_actor_routing()
     test_full_step_and_target_update()
     test_self_destruction_eliminated()

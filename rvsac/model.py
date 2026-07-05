@@ -58,6 +58,12 @@ class RVSACConfig(BaseModel):
     # the critic sees sg[h_t] and only the value head learns from L_V.
     critic_shapes_trunk: bool = False
 
+    # If True, use a separate value head for the actor's terminal bootstrap.
+    # The critic head still learns TD(lambda), while the actor bootstrap head is
+    # grounded only by the bootstrap-free h_H anchor in the loss head. This keeps
+    # TD bootstrap drift from directly inflating the actor objective.
+    separate_actor_value_head: bool = False
+
     # 0 or >= horizon: full BPTT. Otherwise detach h at segment boundaries and
     # let the loss use K-step bootstrapped actor/critic targets.
     bptt_segment: int = 0
@@ -178,6 +184,12 @@ class RVSAC(nn.Module):
         self.value_head_target.load_state_dict(self.value_head.state_dict())
         self.value_head_target.requires_grad_(False)
 
+        if self.config.separate_actor_value_head:
+            self.actor_value_head = ValueHead(self.config, self.puzzle_emb_len)
+            self.actor_value_head_target = ValueHead(self.config, self.puzzle_emb_len)
+            self.actor_value_head_target.load_state_dict(self.actor_value_head.state_dict())
+            self.actor_value_head_target.requires_grad_(False)
+
         # Scales *only* the actor's terminal-bootstrap gradient (V_bar(h_H) -> h_H),
         # i.e. the exploit channel, independent of the honest reward-sum term. 1.0 =
         # full gradient (original behavior). Ramped 0 -> 1 via set_terminal_grad_scale()
@@ -192,6 +204,9 @@ class RVSAC(nn.Module):
         """theta_bar <- (1 - tau) * theta_bar + tau * theta"""
         for p_bar, p in zip(self.value_head_target.parameters(), self.value_head.parameters()):
             p_bar.lerp_(p.to(p_bar.dtype), tau)
+        if self.config.separate_actor_value_head:
+            for p_bar, p in zip(self.actor_value_head_target.parameters(), self.actor_value_head.parameters()):
+                p_bar.lerp_(p.to(p_bar.dtype), tau)
 
     def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor) -> torch.Tensor:
         embedding = self.embed_tokens(input.to(torch.int32))
@@ -233,11 +248,15 @@ class RVSAC(nn.Module):
         critic_states = states[:-1] if self.config.critic_shapes_trunk else [s.detach() for s in states[:-1]]
         values = torch.stack([self.value_head(s) for s in critic_states], dim=1)  # [B, H] fp32
 
-        # V_theta(sg[h_H]): online head trained directly on the boundary state, which
-        # critic_states above never includes. Anchored in the loss head against a
-        # bootstrap-free target (r_{H-1}/(1-gamma)) to give this point real-reward
-        # grounding instead of pure TD(0) extrapolation via value_head_target.
-        terminal_online_value = self.value_head(states[H].detach())  # [B] fp32
+        # Online actor-bootstrap head trained directly on the boundary state.
+        # In the default shared mode this is value_head. With
+        # separate_actor_value_head=True it is an independent head, anchored by a
+        # bootstrap-free target in the loss so TD(lambda) critic drift cannot
+        # directly inflate the actor terminal bootstrap.
+        actor_value_head = self.actor_value_head if self.config.separate_actor_value_head else self.value_head
+        actor_value_head_target = self.actor_value_head_target if self.config.separate_actor_value_head else self.value_head_target
+
+        terminal_online_value = actor_value_head(states[H].detach())  # [B] fp32
 
         with torch.no_grad():
             # V_bar over h_1..h_H for TD(lambda) targets (fully detached)
@@ -248,11 +267,11 @@ class RVSAC(nn.Module):
         # is numerically identical to x for the forward value; only d/dh_H is scaled).
         alpha = self.terminal_grad_scale
         h_H_for_actor = alpha * states[H] + (1 - alpha) * states[H].detach()
-        terminal_value = self.value_head_target(h_H_for_actor)  # [B] fp32, grad -> h_H (scaled)
+        terminal_value = actor_value_head_target(h_H_for_actor)  # [B] fp32, grad -> h_H (scaled)
 
         segment_ends = list(range(K, H, K)) + [H] if segmented else [H]
         segment_states_for_actor = [alpha * states[t] + (1 - alpha) * states[t].detach() for t in segment_ends]
-        segment_terminal_values = torch.stack([self.value_head_target(s) for s in segment_states_for_actor], dim=1)
+        segment_terminal_values = torch.stack([actor_value_head_target(s) for s in segment_states_for_actor], dim=1)
 
         return {
             "logits": logits,
