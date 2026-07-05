@@ -119,11 +119,17 @@ class TransitionHead(nn.Module):
 
 
 class ValueHead(nn.Module):
-    """V_theta: scalar value from the first (puzzle-embedding) position."""
+    """V_theta: scalar value from mean-pooled grid-token positions.
 
-    def __init__(self, config: RVSACConfig) -> None:
+    Reward r_t=-CE_t is itself a mean over the grid-token positions, so the value
+    readout uses the same aggregation instead of the puzzle-embedding prefix position
+    (which critic_shapes_trunk=False gives no direct gradient to shape into a summary).
+    """
+
+    def __init__(self, config: RVSACConfig, puzzle_emb_len: int) -> None:
         super().__init__()
         self.norm_eps = config.rms_norm_eps
+        self.puzzle_emb_len = puzzle_emb_len
         self.fc1 = CastedLinear(config.hidden_size, config.hidden_size, bias=True)
         self.fc2 = CastedLinear(config.hidden_size, 1, bias=True)
         with torch.no_grad():
@@ -131,7 +137,8 @@ class ValueHead(nn.Module):
             self.fc2.bias.zero_()
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
-        x = rms_norm(h[:, 0], variance_epsilon=self.norm_eps)
+        pooled = h[:, self.puzzle_emb_len:].mean(dim=1)
+        x = rms_norm(pooled, variance_epsilon=self.norm_eps)
         return self.fc2(F.silu(self.fc1(x))).to(torch.float32).squeeze(-1)
 
 
@@ -164,12 +171,21 @@ class RVSAC(nn.Module):
 
         # Trunk + heads
         self.transition = TransitionHead(self.config)
-        self.value_head = ValueHead(self.config)
+        self.value_head = ValueHead(self.config, self.puzzle_emb_len)
 
         # EMA (Polyak) target value head: V_bar. Frozen; updated via update_target().
-        self.value_head_target = ValueHead(self.config)
+        self.value_head_target = ValueHead(self.config, self.puzzle_emb_len)
         self.value_head_target.load_state_dict(self.value_head.state_dict())
         self.value_head_target.requires_grad_(False)
+
+        # Scales *only* the actor's terminal-bootstrap gradient (V_bar(h_H) -> h_H),
+        # i.e. the exploit channel, independent of the honest reward-sum term. 1.0 =
+        # full gradient (original behavior). Ramped 0 -> 1 via set_terminal_grad_scale()
+        # from pretrain.py to let the critic calibrate before the actor can lean on it.
+        self.register_buffer("terminal_grad_scale", torch.tensor(1.0))
+
+    def set_terminal_grad_scale(self, scale: float):
+        self.terminal_grad_scale.fill_(float(scale))
 
     @torch.no_grad()
     def update_target(self, tau: float):
@@ -217,22 +233,35 @@ class RVSAC(nn.Module):
         critic_states = states[:-1] if self.config.critic_shapes_trunk else [s.detach() for s in states[:-1]]
         values = torch.stack([self.value_head(s) for s in critic_states], dim=1)  # [B, H] fp32
 
+        # V_theta(sg[h_H]): online head trained directly on the boundary state, which
+        # critic_states above never includes. Anchored in the loss head against a
+        # bootstrap-free target (r_{H-1}/(1-gamma)) to give this point real-reward
+        # grounding instead of pure TD(0) extrapolation via value_head_target.
+        terminal_online_value = self.value_head(states[H].detach())  # [B] fp32
+
         with torch.no_grad():
             # V_bar over h_1..h_H for TD(lambda) targets (fully detached)
             target_values = torch.stack([self.value_head_target(states[t]) for t in range(1, H + 1)], dim=1)  # [B, H]
 
-        # V_bar(h_H) for the actor's terminal bootstrap: frozen params, live input
-        terminal_value = self.value_head_target(states[H])  # [B] fp32, grad -> h_H
+        # V_bar(h_H) for the actor's terminal bootstrap: frozen params, live input, but
+        # the gradient into h_H is scaled by terminal_grad_scale (alpha*x + (1-alpha)*sg[x]
+        # is numerically identical to x for the forward value; only d/dh_H is scaled).
+        alpha = self.terminal_grad_scale
+        h_H_for_actor = alpha * states[H] + (1 - alpha) * states[H].detach()
+        terminal_value = self.value_head_target(h_H_for_actor)  # [B] fp32, grad -> h_H (scaled)
 
         segment_ends = list(range(K, H, K)) + [H] if segmented else [H]
-        segment_terminal_values = torch.stack([self.value_head_target(states[t]) for t in segment_ends], dim=1)
+        segment_states_for_actor = [alpha * states[t] + (1 - alpha) * states[t].detach() for t in segment_ends]
+        segment_terminal_values = torch.stack([self.value_head_target(s) for s in segment_states_for_actor], dim=1)
 
         return {
             "logits": logits,
             "values": values,
+            "terminal_online_value": terminal_online_value,
             "target_values": target_values,
             "terminal_value": terminal_value,
             "segment_terminal_values": segment_terminal_values,
             "segment_ends": segment_ends,
             "u_h_ratio": (u_h_ratio / H).detach(),
+            "terminal_grad_scale": self.terminal_grad_scale.detach(),
         }

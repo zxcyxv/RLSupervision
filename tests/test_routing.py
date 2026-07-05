@@ -82,6 +82,24 @@ def test_critic_isolated():
     print("PASS critic_isolated", g)
 
 
+def test_eq_anchor_isolated():
+    """h_H boundary anchor (V_theta(sg[h_H]) -> r_{H-1}/(1-gamma)) must also stay
+    confined to value_head: it trains the online head on an input (h_H) that
+    critic_states never includes, but must not leak into the trunk/classifier."""
+    model, head = make_model()
+    batch = make_batch()
+    out = model(batch)
+    target = torch.randn_like(out["terminal_online_value"])
+    eq_anchor_loss = (0.5 * (out["terminal_online_value"] - target).square()).mean()
+    g = grads_by_group(model, eq_anchor_loss)
+    assert g["value_head"] > 0, "anchor must train the value head"
+    assert g["transition"] == 0, f"anchor leaked into trunk: {g['transition']}"
+    assert g["lm_head"] == 0, f"anchor leaked into classifier: {g['lm_head']}"
+    assert g["embed"] == 0, f"anchor leaked into embeddings: {g['embed']}"
+    assert g["value_head_target"] == 0
+    print("PASS eq_anchor_isolated", g)
+
+
 def test_actor_routing():
     """Actor term must train trunk+classifier through BPTT, never the critic params (P3-2: actor signal independent of delta)."""
     model, head = make_model()
@@ -241,6 +259,7 @@ def test_segmented_loss_runs():
 if __name__ == "__main__":
     test_td_lambda_targets()
     test_critic_isolated()
+    test_eq_anchor_isolated()
     test_actor_routing()
     test_full_step_and_target_update()
     test_self_destruction_eliminated()

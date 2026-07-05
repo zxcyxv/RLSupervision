@@ -76,6 +76,20 @@ class PretrainConfig(pydantic.BaseModel):
     # Polyak rate for the target value head (theta_bar <- (1-tau) theta_bar + tau theta)
     target_tau: float = 0.005
 
+    # Linear warmup of the actor weight (beta) from 0 to its configured value over this
+    # many optimizer steps. NOTE: this scales the *entire* actor_loss, including the
+    # honest reward-sum term, so it also throttles real CE-driven policy learning. Kept
+    # for backwards compat; prefer terminal_grad_scale_warmup_steps below. 0 = off.
+    beta_warmup_steps: int = 0
+
+    # Linear warmup of terminal_grad_scale (0 -> 1) over this many optimizer steps.
+    # Scales *only* the gradient of the actor's terminal-bootstrap term (V_bar(h_H) ->
+    # h_H, the exploit channel) while leaving the reward-sum term's gradient at full
+    # strength from step 1 -- so honest CE-driven learning proceeds unimpeded while the
+    # critic gets a head start before the actor can lean on its (still-uncalibrated)
+    # terminal value estimate. 0 = off (terminal_grad_scale stays at 1.0, original behavior).
+    terminal_grad_scale_warmup_steps: int = 0
+
     project_name: Optional[str] = None
     run_name: Optional[str] = None
     load_checkpoint: Optional[str] = None
@@ -181,6 +195,20 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
     return model, optimizers, optimizer_lrs
 
 
+def compute_beta(target_beta: float, current_step: int, warmup_steps: int) -> float:
+    """Linear ramp 0 -> target_beta over warmup_steps, then held constant."""
+    if warmup_steps <= 0:
+        return target_beta
+    return target_beta * min(1.0, float(current_step) / float(max(1, warmup_steps)))
+
+
+def compute_terminal_grad_scale(current_step: int, warmup_steps: int) -> float:
+    """Linear ramp 0 -> 1 over warmup_steps, then held at 1 (original behavior)."""
+    if warmup_steps <= 0:
+        return 1.0
+    return min(1.0, float(current_step) / float(max(1, warmup_steps)))
+
+
 def cosine_schedule_with_warmup_lr_lambda(
     current_step: int, *, base_lr: float, num_warmup_steps: int, num_training_steps: int, min_ratio: float = 0.0, num_cycles: float = 0.5
 ):
@@ -261,6 +289,15 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         return
 
     batch = {k: v.cuda() for k, v in batch.items()}
+
+    if config.beta_warmup_steps > 0:
+        target_beta = config.arch.loss.__pydantic_extra__["beta"]  # type: ignore
+        train_state.model.set_beta(compute_beta(target_beta, train_state.step, config.beta_warmup_steps))
+
+    if config.terminal_grad_scale_warmup_steps > 0:
+        train_state.model.set_terminal_grad_scale(
+            compute_terminal_grad_scale(train_state.step, config.terminal_grad_scale_warmup_steps)
+        )
 
     loss, metrics, _ = train_state.model(batch=batch, return_keys=[])
 
@@ -506,7 +543,8 @@ def launch(hydra_config: DictConfig):
                 if train_state.step % 50 == 0 or train_state.step == 1:
                     shown = {k.removeprefix("train/"): round(float(v), 4) for k, v in metrics.items()
                              if k.split("/")[-1] in ("critic_loss", "ce_first", "ce_last", "accuracy", "exact_accuracy",
-                                                     "value_mean", "td_abs", "corr_delta_dr", "u_h_ratio", "return_J")}
+                                                     "value_mean", "td_abs", "corr_delta_dr", "u_h_ratio", "return_J",
+                                                     "beta", "eq_anchor_loss", "terminal_grad_scale")}
                     print(f"\nstep {train_state.step}: {shown}")
             if config.ema:
                 ema_helper.update(eager_model(train_state.model))

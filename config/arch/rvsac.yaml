@@ -6,6 +6,7 @@ loss:
   lam: 0.9         # TD(lambda)
   beta: 0.1        # actor weight (two-timescale: critic fast, actor slow)
   critic_coef: 1.0
+  eq_anchor_coef: 0.3   # h_H boundary anchor: V_theta(sg[h_H]) -> r_{H-1}/(1-gamma), bootstrap-free
 
 horizon: 16        # H recursion steps per rollout (BPTT window)
 bptt_segment: 0    # 0 = full BPTT; e.g. 8 = detach state every 8 steps and use K-step bootstraps

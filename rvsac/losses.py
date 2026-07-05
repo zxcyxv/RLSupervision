@@ -52,17 +52,27 @@ def _pearson(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
 
 class RVSACLossHead(nn.Module):
-    def __init__(self, model: nn.Module, loss_type: str, gamma: float, lam: float, beta: float, critic_coef: float = 1.0):
+    def __init__(self, model: nn.Module, loss_type: str, gamma: float, lam: float, beta: float, critic_coef: float = 1.0,
+                 eq_anchor_coef: float = 0.0):
         super().__init__()
         self.model = model
         self.loss_fn = globals()[loss_type]
         self.gamma = gamma
         self.lam = lam
-        self.beta = beta
         self.critic_coef = critic_coef
+        self.eq_anchor_coef = eq_anchor_coef
+        # Registered as a buffer (not a plain float) so pretrain.py can update it every
+        # step (beta warmup) without triggering torch.compile recompilation on value change.
+        self.register_buffer("beta", torch.tensor(float(beta)))
 
     def update_target(self, tau: float):
         self.model.update_target(tau)
+
+    def set_terminal_grad_scale(self, scale: float):
+        self.model.set_terminal_grad_scale(scale)
+
+    def set_beta(self, beta: float):
+        self.beta.fill_(float(beta))
 
     def forward(self, batch: Dict[str, torch.Tensor], return_keys: Sequence[str] = ()) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         outputs = self.model(batch)
@@ -83,6 +93,7 @@ class RVSACLossHead(nn.Module):
         values = outputs["values"]                  # V_theta(h_t),     t = 0..H-1
         target_values = outputs["target_values"]    # V_bar(h_{t+1}),   t = 0..H-1 (detached)
         terminal_value = outputs["terminal_value"]  # V_bar(h_H), grad -> h_H
+        terminal_online_value = outputs["terminal_online_value"]  # V_theta(sg[h_H]), grad -> value_head params only
         segment_ends = outputs.get("segment_ends", [H])
         segment_starts = [0] + segment_ends[:-1]
         segmented = len(segment_ends) > 1
@@ -97,6 +108,21 @@ class RVSACLossHead(nn.Module):
                     y[:, t] = r_d[:, t] + self.gamma * ((1 - self.lam) * target_values[:, t] + self.lam * y[:, t + 1])
 
         critic_loss = (0.5 * (values - y).square()).mean(-1).sum()  # mean over t, sum over batch
+
+        # --- h_H boundary anchor: bootstrap-free regression target (r_{H-1}/(1-gamma)) ---
+        # y[H-1] is always a pure TD(0) target (recursion base case, no lambda blending
+        # regardless of self.lam) and h_H is never in critic_states, so V_theta never
+        # trains directly on it. This anchors terminal_online_value = V_theta(sg[h_H])
+        # against a target with zero V-dependence, giving this specific point immediate,
+        # real-reward-grounded correction instead of relying solely on the slow TD(lambda)/
+        # Polyak path.
+        #
+        # Penalized in reward units, (1-gamma)*V - r, rather than value units,
+        # V - r/(1-gamma): both encode the same fixed point (V = r/(1-gamma)), but the
+        # value-unit form squares a target of order 1/(1-gamma) (e.g. 40 at gamma=0.975),
+        # inflating the loss ~1/(1-gamma)^2 (~1600x) beyond critic_loss's natural CE^2
+        # scale and making eq_anchor_coef effectively far stronger than its nominal value.
+        eq_anchor_loss = (0.5 * ((1 - self.gamma) * terminal_online_value - r_d[:, -1]).square()).mean()
 
         # --- Actor: J = sum gamma^t r_t + gamma^H V_bar(h_H) ---
         discounts = self.gamma ** torch.arange(H, dtype=torch.float32, device=r.device)
@@ -123,7 +149,7 @@ class RVSACLossHead(nn.Module):
             bootstrap_abs = ((self.gamma ** H) * terminal_value).detach().abs().mean()
         actor_loss = -J.sum()
 
-        loss = self.critic_coef * critic_loss + self.beta * actor_loss
+        loss = self.critic_coef * critic_loss + self.beta * actor_loss + self.eq_anchor_coef * eq_anchor_loss
 
         # --- Metrics & diagnostics (no grad) ---
         with torch.no_grad():
@@ -151,6 +177,9 @@ class RVSACLossHead(nn.Module):
                 "exact_accuracy": (valid & seq_is_correct).sum(),
                 "critic_loss": critic_loss.detach(),
                 "actor_loss": actor_loss.detach(),
+                "eq_anchor_loss": eq_anchor_loss.detach() * valid.sum(),
+                "beta": self.beta.detach() * valid.sum(),
+                "terminal_grad_scale": outputs["terminal_grad_scale"] * valid.sum(),
                 "ce_first": ce[:, 0].detach().sum(),
                 "ce_last": ce[:, -1].detach().sum(),
                 "value_mean": values.mean(-1).sum(),

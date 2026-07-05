@@ -31,6 +31,8 @@ puzzle_emb_weight_decay: 0.1
 puzzle_emb_lr: 1e-2
 
 target_tau: 0.005  # Polyak rate for the target value head
+beta_warmup_steps: 0  # linear ramp 0 -> arch.loss.beta over this many steps; 0 = off (scales whole actor_loss, prefer below)
+terminal_grad_scale_warmup_steps: 0  # linear ramp 0 -> 1 for V_bar(h_H)->h_H gradient only; 0 = off
 
 seed: 0
 min_eval_interval: 0
